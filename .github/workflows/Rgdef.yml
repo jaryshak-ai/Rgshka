@@ -1,0 +1,369 @@
+name: Build MyRegions
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create project files
+        run: |
+          mkdir -p src/main/java/ru/ruslan/myregions src/main/resources
+
+          cat > pom.xml << 'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>ru.ruslan</groupId>
+            <artifactId>MyRegions</artifactId>
+            <version>1.1.1</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>opencollab</id>
+                <url>https://repo.opencollab.dev/maven-snapshots/</url>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>nukkit</artifactId>
+                <version>1.0-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+          </project>
+          POM_EOF
+
+          cat > src/main/resources/plugin.yml << 'YML_EOF'
+          name: MyRegions
+          main: ru.ruslan.myregions.Main
+          version: 1.1.1
+          api: ["1.0.0"]
+          commands:
+            rg:
+              description: Управление регионами
+              permission: myregions.use
+          permissions:
+            myregions.use: { default: true }
+            myregions.admin: { default: op }
+            myregions.limit.bypass: { default: op }
+          YML_EOF
+
+          cat > src/main/java/ru/ruslan/myregions/Main.java << 'JAVA_EOF'
+          package ru.ruslan.myregions;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.block.BlockBreakEvent;
+          import cn.nukkit.event.block.BlockBurnEvent;
+          import cn.nukkit.event.block.BlockPlaceEvent;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityExplodeEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.utils.Config;
+          import cn.nukkit.utils.TextFormat;
+          import java.util.*;
+
+          public class Main extends PluginBase implements Listener {
+              private Config config;
+              private Map<String, Region> regions = new HashMap<>();
+              private Map<String, Location[]> selections = new HashMap<>();
+              private Set<String> hackedPlayers = new HashSet<>();
+              private final int MAX_REGIONS = 3;
+              private final long MAX_VOLUME = 20000;
+
+              @Override
+              public void onEnable() {
+                  getServer().getPluginManager().registerEvents(this, this);
+                  saveDefaultConfig();
+                  config = new Config(getDataFolder() + "/regions.yml", Config.YAML);
+                  loadRegions();
+                  getLogger().info("MyRegions v1.1.1 включен!");
+              }
+
+              private void loadRegions() {
+                  List<Map> list = config.getMapList("regions");
+                  for (Map map : list) {
+                      try {
+                          Region r = Region.fromMap(map);
+                          regions.put(r.name, r);
+                      } catch (Exception e) {
+                          getLogger().warning("Ошибка загрузки региона: " + e.getMessage());
+                      }
+                  }
+              }
+
+              private void saveRegions() {
+                  List<Map<String, Object>> list = new ArrayList<>();
+                  for (Region r : regions.values()) {
+                      list.add(r.toMap());
+                  }
+                  config.set("regions", list);
+                  config.save();
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!(sender instanceof Player)) {
+                      sender.sendMessage(TextFormat.RED + "Только для игроков!");
+                      return true;
+                  }
+                  Player p = (Player) sender;
+                  if (args.length == 0 || args[0].equalsIgnoreCase("help")) {
+                      sendHelp(p);
+                      return true;
+                  }
+                  switch (args[0].toLowerCase()) {
+                      case "pos1":
+                      case "pos2":
+                          if (p.getInventory().getItemInHand().getId() != Item.WOODEN_AXE) {
+                              p.sendMessage(TextFormat.RED + "Возьмите деревянный топор!");
+                              return true;
+                          }
+                          Location[] sel = selections.getOrDefault(p.getName(), new Location[2]);
+                          sel[args[0].equalsIgnoreCase("pos1") ? 0 : 1] = p.getLocation();
+                          selections.put(p.getName(), sel);
+                          p.sendMessage(TextFormat.GREEN + "Точка установлена!");
+                          return true;
+                      case "create":
+                          if (args.length < 2) return true;
+                          Location[] cSel = selections.get(p.getName());
+                          if (cSel == null || cSel[0] == null || cSel[1] == null) {
+                              p.sendMessage(TextFormat.RED + "Сначала установите обе точки!");
+                              return true;
+                          }
+                          if (!p.hasPermission("myregions.limit.bypass")) {
+                              long count = regions.values().stream().filter(r -> r.owner.equalsIgnoreCase(p.getName())).count();
+                              if (count >= MAX_REGIONS) {
+                                  p.sendMessage(TextFormat.RED + "Лимит: " + MAX_REGIONS + " региона!");
+                                  return true;
+                              }
+                          }
+                          String regName = args[1].toLowerCase();
+                          if (regions.containsKey(regName)) {
+                              p.sendMessage(TextFormat.RED + "Регион уже существует!");
+                              return true;
+                          }
+                          Region newReg = new Region(regName, p.getName(), cSel[0], cSel[1]);
+                          if (!p.hasPermission("myregions.limit.bypass") && newReg.volume > MAX_VOLUME) {
+                              p.sendMessage(TextFormat.RED + "Максимум 20000 блоков!");
+                              return true;
+                          }
+                          regions.put(regName, newReg);
+                          saveRegions();
+                          p.sendMessage(TextFormat.GREEN + "Регион " + regName + " создан!");
+                          return true;
+                      case "add":
+                          if (args.length < 3) return true;
+                          Region rAdd = regions.get(args[1].toLowerCase());
+                          if (rAdd == null || !rAdd.owner.equalsIgnoreCase(p.getName())) {
+                              p.sendMessage(TextFormat.RED + "Это не ваш регион!");
+                              return true;
+                          }
+                          rAdd.members.add(args[2]);
+                          saveRegions();
+                          p.sendMessage(TextFormat.GREEN + "Игрок добавлен!");
+                          return true;
+                      case "flag":
+                          if (args.length < 4) return true;
+                          Region rFlag = regions.get(args[1].toLowerCase());
+                          if (rFlag == null || !rFlag.owner.equalsIgnoreCase(p.getName())) {
+                              p.sendMessage(TextFormat.RED + "Это не ваш регион!");
+                              return true;
+                          }
+                          if (args[2].equalsIgnoreCase("pvp")) {
+                              rFlag.pvp = args[3].equalsIgnoreCase("on");
+                              saveRegions();
+                              p.sendMessage(TextFormat.GREEN + "PvP: " + (rFlag.pvp ? "ВКЛ" : "ВЫКЛ"));
+                          }
+                          return true;
+                      case "hack":
+                          if (!p.hasPermission("myregions.admin") || args.length < 2) return true;
+                          if (args[1].equalsIgnoreCase("on")) {
+                              hackedPlayers.add(p.getName());
+                              p.sendMessage(TextFormat.GOLD + "Режим Бога ВКЛ.");
+                          } else {
+                              hackedPlayers.remove(p.getName());
+                              p.sendMessage(TextFormat.YELLOW + "Режим Бога ВЫКЛ.");
+                          }
+                          return true;
+                      case "delete":
+                          if (args.length < 2) return true;
+                          Region rDel = regions.get(args[1].toLowerCase());
+                          if (rDel != null && (rDel.owner.equalsIgnoreCase(p.getName()) || p.hasPermission("myregions.admin"))) {
+                              regions.remove(args[1].toLowerCase());
+                              saveRegions();
+                              p.sendMessage(TextFormat.GREEN + "Регион удален.");
+                          }
+                          return true;
+                      default:
+                          p.sendMessage(TextFormat.RED + "Введите /rg help");
+                          return true;
+                  }
+              }
+
+              private void sendHelp(Player p) {
+                  p.sendMessage(TextFormat.GOLD + "=== MyRegions ===");
+                  p.sendMessage(TextFormat.YELLOW + "/rg pos1|pos2|create|add|flag|delete");
+                  if (p.hasPermission("myregions.admin")) {
+                      p.sendMessage(TextFormat.RED + "/rg hack <on|off>");
+                  }
+              }
+
+              private boolean isBypassed(Player p) {
+                  return hackedPlayers.contains(p.getName());
+              }
+
+              private Region getRegionAt(Location loc) {
+                  for (Region r : regions.values()) {
+                      if (r.isInside(loc)) return r;
+                  }
+                  return null;
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onBreak(BlockBreakEvent e) {
+                  if (isBypassed(e.getPlayer())) return;
+                  Region r = getRegionAt(e.getBlock().getLocation());
+                  if (r != null && !r.owner.equalsIgnoreCase(e.getPlayer().getName()) && !r.members.contains(e.getPlayer().getName())) {
+                      e.setCancelled(true);
+                      e.getPlayer().sendMessage(TextFormat.RED + "Это чужая территория!");
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onPlace(BlockPlaceEvent e) {
+                  if (isBypassed(e.getPlayer())) return;
+                  Region r = getRegionAt(e.getBlock().getLocation());
+                  if (r != null && !r.owner.equalsIgnoreCase(e.getPlayer().getName()) && !r.members.contains(e.getPlayer().getName())) {
+                      e.setCancelled(true);
+                      e.getPlayer().sendMessage(TextFormat.RED + "Это чужая территория!");
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onInteract(PlayerInteractEvent e) {
+                  Player p = e.getPlayer();
+                  Region r = getRegionAt(e.getBlock().getLocation());
+                  if (e.getItem() != null && e.getItem().getId() == Item.WOODEN_AXE && r != null) {
+                      p.sendMessage(TextFormat.GOLD + "Регион: " + TextFormat.YELLOW + r.name + TextFormat.GOLD + " | Владелец: " + TextFormat.YELLOW + r.owner);
+                      return;
+                  }
+                  if (isBypassed(p) || r == null) return;
+                  if (!r.owner.equalsIgnoreCase(p.getName()) && !r.members.contains(p.getName())) {
+                      int id = e.getBlock().getId();
+                      if (id == Item.CHEST || id == Item.TRAPPED_CHEST || id == Item.ENDER_CHEST || id == Item.FURNACE || id == Item.BURNING_FURNACE || id == Item.BREWING_STAND || id == Item.HOPPER || id == Item.DROPPER || id == Item.DISPENSER || id == 218) {
+                          e.setCancelled(true);
+                          p.sendMessage(TextFormat.RED + "Чужие контейнеры закрыты!");
+                      }
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onExplode(EntityExplodeEvent e) {
+                  e.getBlockList().removeIf(block -> getRegionAt(block.getLocation()) != null);
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onBurn(BlockBurnEvent e) {
+                  if (getRegionAt(e.getBlock().getLocation()) != null) e.setCancelled(true);
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onPvP(EntityDamageByEntityEvent e) {
+                  if (!(e.getEntity() instanceof Player) || !(e.getDamager() instanceof Player)) return;
+                  Region r = getRegionAt(e.getEntity().getLocation());
+                  if (r != null && !r.pvp) {
+                      e.setCancelled(true);
+                      ((Player) e.getDamager()).sendMessage(TextFormat.RED + "PvP запрещено в регионе!");
+                  }
+              }
+
+              class Region {
+                  String name, owner, world;
+                  Set<String> members = new HashSet<>();
+                  double minX, minY, minZ, maxX, maxY, maxZ;
+                  boolean pvp = true;
+                  long volume;
+
+                  public Region(String name, String owner, Location loc1, Location loc2) {
+                      this.name = name;
+                      this.owner = owner;
+                      this.world = loc1.getLevel().getName();
+                      this.minX = Math.min(loc1.getX(), loc2.getX());
+                      this.minY = Math.min(loc1.getY(), loc2.getY());
+                      this.minZ = Math.min(loc1.getZ(), loc2.getZ());
+                      this.maxX = Math.max(loc1.getX(), loc2.getX());
+                      this.maxY = Math.max(loc1.getY(), loc2.getY());
+                      this.maxZ = Math.max(loc1.getZ(), loc2.getZ());
+                      this.volume = (long)(maxX - minX + 1) * (long)(maxY - minY + 1) * (long)(maxZ - minZ + 1);
+                  }
+
+                  public Region() {}
+
+                  public boolean isInside(Location loc) {
+                      if (!loc.getLevel().getName().equals(this.world)) return false;
+                      return loc.getX() >= minX && loc.getX() <= maxX && loc.getY() >= minY && loc.getY() <= maxY && loc.getZ() >= minZ && loc.getZ() <= maxZ;
+                  }
+
+                  public Map<String, Object> toMap() {
+                      Map<String, Object> map = new HashMap<>();
+                      map.put("name", name); map.put("owner", owner); map.put("world", world);
+                      map.put("minX", minX); map.put("minY", minY); map.put("minZ", minZ);
+                      map.put("maxX", maxX); map.put("maxY", maxY); map.put("maxZ", maxZ);
+                      map.put("volume", volume); map.put("pvp", pvp);
+                      map.put("members", new ArrayList<>(members));
+                      return map;
+                  }
+
+                  @SuppressWarnings("unchecked")
+                  public static Region fromMap(Map map) {
+                      Region r = new Region();
+                      r.name = (String) map.get("name"); r.owner = (String) map.get("owner"); r.world = (String) map.get("world");
+                      r.minX = ((Number) map.get("minX")).doubleValue(); r.minY = ((Number) map.get("minY")).doubleValue(); r.minZ = ((Number) map.get("minZ")).doubleValue();
+                      r.maxX = ((Number) map.get("maxX")).doubleValue(); r.maxY = ((Number) map.get("maxY")).doubleValue(); r.maxZ = ((Number) map.get("maxZ")).doubleValue();
+                      r.volume = ((Number) map.get("volume")).longValue(); r.pvp = (Boolean) map.getOrDefault("pvp", true);
+                      List<String> mems = (List<String>) map.get("members");
+                      if (mems != null) r.members.addAll(mems);
+                      return r;
+                  }
+              }
+          }
+          JAVA_EOF
+
+      - name: Fix indentation
+        run: |
+          sed -i 's/^          //' src/main/java/ru/ruslan/myregions/Main.java
+          sed -i 's/^          //' src/main/resources/plugin.yml
+          sed -i 's/^          //' pom.xml
+
+      - name: Build
+        run: mvn -B package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyRegions
+          path: target/MyRegions-1.1.1.jar
